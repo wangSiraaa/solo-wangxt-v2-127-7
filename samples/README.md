@@ -14,3 +14,4 @@ storage or threading boundary:
 | `07_bad_cte.eml` | invalid base64 content-transfer-encoding payload |
 | `08_traversal.eml` | `../` and RFC2231 `%2f` traversal in attachment filename |
 | `09_html_xss.eml` | script/iframe/style, event handlers, remote `src`, `javascript:` link, one valid `cid:` image |
+| `10_masquerade.eml` | attachment security: PE (MZ) signature named `notes.txt` (executable masquerade), PNG signature named `photo.jpg` (type mismatch), unrecognized `data.bin` blob (unknown, never cleared), plus a genuine text part — same message, separate verdicts |

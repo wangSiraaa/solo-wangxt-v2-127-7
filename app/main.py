@@ -16,12 +16,14 @@ from app.memory_repository import MemoryRepository
 from app.pg_repository import PgRepository
 from app.repository import Repository
 from app.schemas import (
+    AttachmentListResponse,
     FailureOut,
     Health,
     IngestDetail,
     IngestResponse,
     MessageDetail,
     MessageSummary,
+    RescanResponse,
     SearchResponse,
     ThreadDetail,
     ThreadSummary,
@@ -179,6 +181,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return thread
 
     # ---- attachments -----------------------------------------------------
+    @app.get("/attachments", response_model=AttachmentListResponse, tags=["attachments"])
+    def list_attachments(
+        request: Request,
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        category: str | None = Query(
+            None,
+            pattern="^(executable|mismatch|unknown|consistent)$",
+            description="exact security category filter",
+        ),
+        suspicious: bool | None = Query(
+            None,
+            description="true: needs review (executable/mismatch/unknown and "
+            "unclassified legacy rows); false: signature-consistent only",
+        ),
+    ) -> dict[str, Any]:
+        return get_state(request).repo.list_attachments(
+            suspicious=suspicious, category=category, limit=limit, offset=offset
+        )
+
+    @app.post("/attachments/rescan", response_model=RescanResponse, tags=["attachments"])
+    def rescan_attachments(
+        request: Request,
+        only_unclassified: bool = Query(
+            True,
+            description="default: backfill legacy rows only; set false to re-run "
+            "every row. Stored bytes are never modified.",
+        ),
+        limit: int | None = Query(None, ge=1, le=10000),
+    ) -> dict[str, Any]:
+        return get_state(request).service.rescan_attachments(
+            only_unclassified=only_unclassified, limit=limit
+        )
+
     @app.get("/messages/{pk}/attachments/{attachment_id}/download", tags=["attachments"])
     def download_attachment(request: Request, pk: int, attachment_id: int) -> Response:
         st = get_state(request)
@@ -203,11 +239,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         safe_name = safe_basename(att.get("filename") or "") or f"attachment-{attachment_id}.bin"
         # FileResponse streams from disk; we never put content into a log line.
-        return FileResponse(
+        response = FileResponse(
             path,
             media_type=att.get("content_type") or "application/octet-stream",
             filename=safe_name,
         )
+        # Advisories only: legitimate forensics downloads are never refused.
+        # nosniff stops a browser from "helpfully" re-interpreting the bytes as
+        # a different (possibly executable) type.
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        sec = att.get("security")
+        if sec is None:
+            warning = (
+                '299 emlarchive-002 "unclassified attachment (legacy record); '
+                'run POST /attachments/rescan before trusting this content"'
+            )
+            response.headers["Warning"] = warning
+            response.headers["X-Attachment-Security"] = "unclassified"
+        elif sec.get("category") != "consistent":
+            cat = sec.get("category")
+            phrases = {
+                "executable": "executable content signature detected; do not execute",
+                "mismatch": "content signature does not match declared MIME/extension",
+                "unknown": "unrecognized format; content safety not confirmed",
+            }
+            response.headers["Warning"] = f'299 emlarchive-001 "{phrases.get(cat, cat)}"'
+            response.headers["X-Attachment-Security"] = cat
+            response.headers["X-Attachment-Detected-Signature"] = sec.get("detected_signature") or "none"
+        else:
+            # Even consistent attachments are only "signatures agree", never
+            # certified harmless; surface the category without a Warning.
+            response.headers["X-Attachment-Security"] = "consistent"
+        return response
 
     @app.get("/health", response_model=Health, tags=["meta"])
     def health(request: Request) -> Health:

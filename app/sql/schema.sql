@@ -93,10 +93,35 @@ CREATE TABLE IF NOT EXISTS attachments (
     byte_size       BIGINT NOT NULL,
     checksum_sha256 TEXT NOT NULL,
     storage_path    TEXT,
-    stored          BOOLEAN NOT NULL DEFAULT FALSE
+    stored          BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Read-only content classification (finite signature + extension rules).
+    -- NULL on purpose for rows that predate the classifier; filled by the
+    -- read-only rescan without touching the stored bytes.
+    security_category       TEXT CHECK (security_category IN
+                            ('executable','mismatch','unknown','consistent')),
+    security_detected_sig   TEXT,
+    security_detected_mime  TEXT,
+    security_evidence       JSONB,
+    security_classifier     TEXT,
+    security_inspected      BIGINT,
+    security_classified_at  TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_attach_message ON attachments(message_pk);
 CREATE INDEX IF NOT EXISTS idx_attach_sha ON attachments(checksum_sha256);
+
+-- Idempotent upgrade for databases created before attachment classification.
+-- ADD COLUMN IF NOT EXISTS leaves existing bytes/rows untouched; legacy rows
+-- keep NULL classification until an explicit read-only rescan. The security
+-- index is created *after* the columns so old databases upgrade in place.
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS security_category TEXT
+    CHECK (security_category IN ('executable','mismatch','unknown','consistent'));
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS security_detected_sig TEXT;
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS security_detected_mime TEXT;
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS security_evidence JSONB;
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS security_classifier TEXT;
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS security_inspected BIGINT;
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS security_classified_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_attach_sec_cat ON attachments(security_category);
 
 CREATE TABLE IF NOT EXISTS defects (
     id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

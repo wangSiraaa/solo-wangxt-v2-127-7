@@ -19,6 +19,25 @@ class DefectOut(BaseModel):
     message: str
 
 
+class SecurityEvidenceOut(BaseModel):
+    rule: str
+    detail: str
+
+
+class AttachmentSecurityOut(BaseModel):
+    category: str  # executable | mismatch | unknown | consistent
+    # True for executable/mismatch/unknown. Note: "consistent" means only that
+    # the finite signatures agreed — it is never a claim that content is safe.
+    suspicious: bool
+    declared_mime: str | None = None
+    declared_extension: str | None = None
+    detected_signature: str | None = None
+    detected_mime: str | None = None
+    inspected_bytes: int | None = None
+    classifier_version: str | None = None
+    evidence: list[SecurityEvidenceOut] = Field(default_factory=list)
+
+
 class AttachmentSummary(BaseModel):
     mime_path: str
     filename: str | None = None
@@ -28,6 +47,7 @@ class AttachmentSummary(BaseModel):
     byte_size: int
     sha256: str | None = None
     error: str | None = None
+    security: AttachmentSecurityOut | None = None
 
 
 class IngestResponse(BaseModel):
@@ -74,13 +94,58 @@ class AttachmentOut(BaseModel):
     message_pk: int
     mime_path: str
     content_type: str
+    charset: str | None = None
+    disposition: str
     filename: str | None
     raw_filename: str | None
     content_id: str | None
+    content_location: str | None = None
     byte_size: int
     checksum_sha256: str
     storage_path: str | None
     stored: bool
+    # Nested classification; None only on legacy rows that predate rescan.
+    security: AttachmentSecurityOut | None = None
+
+
+class AttachmentListResponse(BaseModel):
+    count: int
+    limit: int
+    offset: int
+    results: list[AttachmentOut]
+
+
+class RescanItem(BaseModel):
+    attachment_id: int
+    message_pk: int | None = None
+    filename: str | None = None
+    category: str
+    suspicious: bool
+    previous_category: str | None = None
+    detected_signature: str | None = None
+    storage_path: str | None = None
+    sha256: str | None = None
+    classifier_version: str | None = None
+
+
+class RescanSkip(BaseModel):
+    attachment_id: int
+    reason: str
+    detail: str
+    recorded_sha256: str | None = None
+    actual_sha256: str | None = None
+
+
+class RescanResponse(BaseModel):
+    scanned: int
+    classified: int
+    newly_classified: int
+    unchanged: int
+    changed: int
+    skipped: list[RescanSkip] = Field(default_factory=list)
+    items: list[RescanItem] = Field(default_factory=list)
+    read_only: bool
+    only_unclassified: bool
 
 
 class HeaderOut(BaseModel):

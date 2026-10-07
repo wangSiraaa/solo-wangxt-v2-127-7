@@ -96,3 +96,34 @@ def test_idempotent_schema_init(pg_client):
     # creating a second repository over the same DSN must not error on DDL
     arch.repo.init_schema()
     assert c.get("/health").status_code == 200
+
+
+def test_attachment_security_end_to_end_on_pg(pg_client):
+    c, _ = pg_client
+    r = _post(c, "10_masquerade.eml")
+    assert r.status_code == 201, r.text
+    pk = r.json()["message_pk"]
+    atts = c.get(f"/messages/{pk}").json()["attachments"]
+    by_name = {a["filename"]: a for a in atts}
+    assert by_name["notes.txt"]["security"]["category"] == "executable"
+    assert by_name["photo.jpg"]["security"]["category"] == "mismatch"
+    assert by_name["data.bin"]["security"]["category"] == "unknown"
+    assert by_name["readme.txt"]["security"]["category"] == "consistent"
+
+    # SQL-backed review queue
+    queue = c.get("/attachments", params={"suspicious": "true"}).json()
+    assert queue["count"] == 3
+    assert all(a["security"]["category"] != "consistent" for a in queue["results"])
+
+    # evidence is a real JSONB column
+    exe = by_name["notes.txt"]
+    rules = {e["rule"] for e in exe["security"]["evidence"]}
+    assert "magic:dos_pe_mz" in rules and "conflict:extension" in rules
+
+    # rescan is read-only and stable against the SQL implementation too
+    rep = c.post("/attachments/rescan", params={"only_unclassified": "false"}).json()
+    assert rep["scanned"] == 4 and rep["changed"] == 0 and rep["read_only"] is True
+    again_exe = c.get(f"/messages/{pk}").json()["attachments"]
+    again_exe = next(a for a in again_exe if a["filename"] == "notes.txt")
+    assert again_exe["storage_path"] == exe["storage_path"]
+    assert again_exe["security"]["category"] == "executable"

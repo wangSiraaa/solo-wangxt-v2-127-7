@@ -1,3 +1,10 @@
+from .attachment_security import (
+    CLASSIFIER_VERSION,
+    AttachmentCategory,
+    AttachmentSecurity,
+    SecurityEvidence,
+    classify_attachment,
+)
 from .eml_parser import ParseFailure, parse_eml
 from .html_sanitizer import escape_html, sanitize_html, strip_to_text
 from .models import (
@@ -25,4 +32,9 @@ __all__ = [
     "PartNode",
     "ParseStatus",
     "ContentDisposition",
+    "AttachmentCategory",
+    "AttachmentSecurity",
+    "SecurityEvidence",
+    "classify_attachment",
+    "CLASSIFIER_VERSION",
 ]

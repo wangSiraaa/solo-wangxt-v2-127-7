@@ -44,3 +44,37 @@ class Repository(Protocol):
     def list_failures(self, limit: int, offset: int) -> list[dict[str, Any]]: ...
     def get_attachment(self, attachment_id: int) -> dict[str, Any] | None: ...
     def get_attachment_by_message(self, message_pk: int, attachment_id: int) -> dict[str, Any] | None: ...
+    def list_attachments(
+        self,
+        *,
+        suspicious: bool | None,
+        category: str | None,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        """Attachment review queue.
+
+        ``suspicious=True`` selects rows needing review (executable/mismatch/
+        unknown, and legacy unclassified rows); ``suspicious=False`` selects
+        signature-consistent rows. ``category`` filters one category exactly.
+        """
+        ...
+    def attachments_for_rescan(
+        self, *, only_unclassified: bool, limit: int | None
+    ) -> list[dict[str, Any]]:
+        """Return stored attachment rows for the read-only classification rescan."""
+        ...
+    def set_attachment_security(
+        self,
+        attachment_id: int,
+        *,
+        category: str,
+        detected_signature: str | None,
+        detected_mime: str | None,
+        evidence: list[dict[str, Any]],
+        classifier_version: str,
+        inspected_bytes: int,
+        classified_at: Any,
+    ) -> None:
+        """Write classification metadata only; attachment bytes never change."""
+        ...

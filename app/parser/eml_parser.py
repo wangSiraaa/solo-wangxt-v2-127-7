@@ -14,6 +14,7 @@ from email.message import Message
 from email.policy import SMTP
 from email.utils import getaddresses, parsedate_to_datetime
 
+from .attachment_security import classify_attachment
 from .html_sanitizer import sanitize_html, strip_to_text
 from .models import (
     Address,
@@ -344,6 +345,14 @@ def parse_eml(data: bytes) -> ParsedMessage:
                     checksum_sha256=hashlib.sha256(raw).hexdigest(),
                     bytes_to_persist=raw,
                     storage_path=None,
+                    # Read-only classification: inspects a bounded byte prefix,
+                    # never executes. Filename/MIME are the *declared* claims.
+                    security=classify_attachment(
+                        raw,
+                        declared_mime=ctype,
+                        filename=filename,
+                        declared_charset=part.get_content_charset(),
+                    ),
                 )
             )
             continue

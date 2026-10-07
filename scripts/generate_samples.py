@@ -209,6 +209,46 @@ def html_xss() -> bytes:
     )
 
 
+def masquerade_attachments() -> bytes:
+    """Security classification boundary cases in one message.
+
+    * ``notes.txt`` carries a PE (MZ) signature -> executable masquerade;
+    * ``photo.jpg`` carries a PNG signature -> type mismatch;
+    * ``data.bin`` is an unrecognized blob -> unknown (never called safe);
+    * ``readme.txt`` is genuinely a text file with the SAME name as the
+      disguised part -> same name, different content, separate classification.
+    """
+    import base64
+
+    def part(payload: bytes, ctype: str, filename: str) -> bytes:
+        return (
+            f'Content-Type: {ctype}; name="{filename}"\r\n'.encode()
+            + f'Content-Disposition: attachment; filename="{filename}"\r\n'.encode()
+            + b"Content-Transfer-Encoding: base64\r\n\r\n"
+            + base64.encodebytes(payload)
+        )
+
+    pe = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff" + b"\x00" * 48
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
+    blob = bytes((i * 31 + 7) % 256 for i in range(512))
+    return (
+        b"Message-ID: <sec-01@example.com>\r\n"
+        b"From: sec@example.com\r\nSubject: Disguised attachments\r\n"
+        b"Date: Tue, 30 Sep 2026 15:00:00 +0000\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b'Content-Type: multipart/mixed; boundary="SEC"\r\n\r\n'
+        b"--SEC\r\nContent-Type: text/plain\r\n\r\nsee attachments\r\n--SEC\r\n"
+        + part(pe, "text/plain", "notes.txt")
+        + b"--SEC\r\n"
+        + part(png, "image/jpeg", "photo.jpg")
+        + b"--SEC\r\n"
+        + part(blob, "application/octet-stream", "data.bin")
+        + b"--SEC\r\n"
+        + part(b"ordinary text file\n", "text/plain", "readme.txt")
+        + b"--SEC--\r\n"
+    )
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     write("01_multibyte.eml", multibyte())
@@ -223,6 +263,7 @@ def main() -> None:
     write("07_bad_cte.eml", bad_cte())
     write("08_traversal.eml", traversal_attachment())
     write("09_html_xss.eml", html_xss())
+    write("10_masquerade.eml", masquerade_attachments())
 
 
 if __name__ == "__main__":

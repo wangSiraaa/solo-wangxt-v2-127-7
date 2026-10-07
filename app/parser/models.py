@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
+from .attachment_security import AttachmentSecurity
+
 
 class ParseStatus(str, Enum):
     OK = "ok"
@@ -79,6 +81,9 @@ class Attachment:
     # Filled in by the storage layer; parser leaves both as None.
     storage_path: str | None = None  # path relative to the controlled root
     bytes_to_persist: bytes | None = field(default=None, repr=False)
+    # Read-only signature/extension classification (parser fills this in);
+    # None only for rows produced before the classifier existed (legacy).
+    security: "AttachmentSecurity | None" = None
 
 
 @dataclass(frozen=True)

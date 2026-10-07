@@ -9,6 +9,11 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
+from app.parser.attachment_security import (
+    REVIEW_CATEGORIES,
+    security_from_columns,
+    security_to_json,
+)
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
 from app.threads import ThreadInput, compute_threads
@@ -124,6 +129,7 @@ class MemoryRepository:
                 )
             for att in parsed.attachments:
                 self._att_seq += 1
+                sec = security_to_json(att.security)
                 self.attachments.append(
                     {
                         "id": self._att_seq,
@@ -140,6 +146,13 @@ class MemoryRepository:
                         "checksum_sha256": att.checksum_sha256,
                         "storage_path": att.storage_path,
                         "stored": att.storage_path is not None,
+                        "security_category": (sec or {}).get("category"),
+                        "security_detected_sig": (sec or {}).get("detected_signature"),
+                        "security_detected_mime": (sec or {}).get("detected_mime"),
+                        "security_evidence": (sec or {}).get("evidence"),
+                        "security_classifier": (sec or {}).get("classifier_version"),
+                        "security_inspected": (sec or {}).get("inspected_bytes"),
+                        "security_classified_at": datetime.now(timezone.utc) if sec else None,
                     }
                 )
         self.defects.extend(
@@ -203,7 +216,9 @@ class MemoryRepository:
             return None
         out = dict(m)
         out["bodies"] = [dict(b) for b in self.bodies if b["message_pk"] == pk]
-        out["attachments"] = [dict(a) for a in self.attachments if a["message_pk"] == pk]
+        out["attachments"] = [
+            _shape_attachment(a) for a in self.attachments if a["message_pk"] == pk
+        ]
         out["defects"] = [
             {"stage": d["stage"], "level": d["level"], "message": d["message"]}
             for d in self.defects
@@ -324,5 +339,104 @@ class MemoryRepository:
     def get_attachment(self, attachment_id: int) -> dict[str, Any] | None:
         for a in self.attachments:
             if a["id"] == attachment_id:
-                return dict(a)
+                return _shape_attachment(a)
         return None
+
+    def get_attachment_by_message(self, message_pk: int, attachment_id: int) -> dict[str, Any] | None:
+        for a in self.attachments:
+            if a["id"] == attachment_id and a["message_pk"] == message_pk:
+                return _shape_attachment(a)
+        return None
+
+    # -- attachment security review / read-only rescan ---------------------
+    def list_attachments(
+        self,
+        *,
+        suspicious: bool | None = None,
+        category: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        rows = []
+        for a in self.attachments:
+            if category is not None and a.get("security_category") != category:
+                continue
+            if suspicious is not None:
+                cat = a.get("security_category")
+                # Unclassified legacy rows are never offered as "clear"; they
+                # are shown in the review queue until a rescan classifies them.
+                is_review = cat is None or cat in REVIEW_CATEGORIES
+                if suspicious and not is_review:
+                    continue
+                if suspicious is False and is_review:
+                    continue
+            rows.append(a)
+        ordered = sorted(rows, key=lambda x: x["id"], reverse=True)
+        items = [_shape_attachment(a) for a in ordered[offset : offset + limit]]
+        return {"count": len(rows), "limit": limit, "offset": offset, "results": items}
+
+    def attachments_for_rescan(
+        self, *, only_unclassified: bool, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        rows = [dict(a) for a in self.attachments]
+        if only_unclassified:
+            rows = [a for a in rows if a.get("security_category") is None]
+        rows.sort(key=lambda x: x["id"])
+        return rows[:limit] if limit is not None else rows
+
+    def set_attachment_security(
+        self,
+        attachment_id: int,
+        *,
+        category: str,
+        detected_signature: str | None,
+        detected_mime: str | None,
+        evidence: list[dict[str, Any]],
+        classifier_version: str,
+        inspected_bytes: int,
+        classified_at: datetime,
+    ) -> None:
+        for a in self.attachments:
+            if a["id"] == attachment_id:
+                a["security_category"] = category
+                a["security_detected_sig"] = detected_signature
+                a["security_detected_mime"] = detected_mime
+                a["security_evidence"] = evidence
+                a["security_classifier"] = classifier_version
+                a["security_inspected"] = inspected_bytes
+                a["security_classified_at"] = classified_at
+                return
+        raise KeyError(attachment_id)
+
+
+def _shape_attachment(a: dict[str, Any]) -> dict[str, Any]:
+    """Return an API-shaped row with nested security facts (flat cols kept)."""
+    out = dict(a)
+    out["security"] = security_from_columns(
+        category=a.get("security_category"),
+        detected_sig=a.get("security_detected_sig"),
+        detected_mime=a.get("security_detected_mime"),
+        evidence=a.get("security_evidence"),
+        classifier=a.get("security_classifier"),
+        inspected=a.get("security_inspected"),
+        declared_mime=_raw_mime_of(a.get("content_type")),
+        declared_extension=_ext_of(a.get("filename")),
+    )
+    return out
+
+
+def _raw_mime_of(content_type: str | None) -> str | None:
+    if not content_type:
+        return None
+    raw = content_type.split(";", 1)[0].strip().lower()
+    return raw or None
+
+
+def _ext_of(filename: str | None) -> str | None:
+    if not filename:
+        return None
+    leaf = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    if "." not in leaf:
+        return None
+    ext = leaf.rsplit(".", 1)[1].strip().lower()
+    return ext or None

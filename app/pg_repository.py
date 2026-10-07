@@ -9,9 +9,24 @@ from typing import Any, Sequence
 import psycopg
 from psycopg.types.json import Jsonb
 
+from app.parser.attachment_security import (
+    REVIEW_CATEGORIES,
+    security_from_columns,
+    security_to_json,
+)
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
 from app.threads import ThreadInput, compute_threads
+
+_SECURITY_COLUMNS = (
+    "security_category",
+    "security_detected_sig",
+    "security_detected_mime",
+    "security_evidence",
+    "security_classifier",
+    "security_inspected",
+    "security_classified_at",
+)
 
 _SCHEMA_PATH = Path(__file__).parent / "sql" / "schema.sql"
 
@@ -147,12 +162,16 @@ class PgRepository:
 
                 for att in parsed.attachments:
                     rel = att.storage_path
+                    sec = security_to_json(att.security)
                     cur.execute(
                         """
                         INSERT INTO attachments (message_pk, mime_path, content_type, charset,
                             disposition, filename, raw_filename, content_id, content_location,
-                            byte_size, checksum_sha256, storage_path, stored)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            byte_size, checksum_sha256, storage_path, stored,
+                            security_category, security_detected_sig, security_detected_mime,
+                            security_evidence, security_classifier, security_inspected,
+                            security_classified_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         """,
                         (
                             message_pk,
@@ -168,6 +187,13 @@ class PgRepository:
                             att.checksum_sha256,
                             rel,
                             rel is not None,
+                            (sec or {}).get("category"),
+                            (sec or {}).get("detected_signature"),
+                            (sec or {}).get("detected_mime"),
+                            Jsonb((sec or {}).get("evidence")),
+                            (sec or {}).get("classifier_version"),
+                            (sec or {}).get("inspected_bytes"),
+                            datetime.now(timezone.utc) if sec else None,
                         ),
                     )
 
@@ -239,12 +265,13 @@ class PgRepository:
         msg = dict(zip(cols, row))
         for table, key in (
             ("bodies", "bodies"),
-            ("attachments", "attachments"),
             ("defects", "defects"),
         ):
             cur.execute(f"SELECT * FROM {table} WHERE message_pk = %s ORDER BY id", (pk,))
             c = [x.name for x in cur.description]
             msg[key] = [dict(zip(c, r)) for r in cur.fetchall()]
+        cur.execute("SELECT * FROM attachments WHERE message_pk = %s ORDER BY id", (pk,))
+        msg["attachments"] = [_shape_attachment_row(r, cur.description) for r in cur.fetchall()]
         cur.execute("SELECT raw_path FROM ingests WHERE id = %s", (msg["ingest_id"],))
         r = cur.fetchone()
         msg["raw_path"] = r[0] if r else None
@@ -371,8 +398,141 @@ class PgRepository:
             row = cur.fetchone()
             if not row:
                 return None
-            cols = [c.name for c in cur.description]
-            return _jsonify(dict(zip(cols, row)))
+            return _shape_attachment_row(row, cur.description)
+
+    def get_attachment_by_message(self, message_pk: int, attachment_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM attachments WHERE id = %s AND message_pk = %s",
+                (attachment_id, message_pk),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return _shape_attachment_row(row, cur.description)
+
+    # -- attachment security review / read-only rescan ---------------------
+    def list_attachments(
+        self,
+        *,
+        suspicious: bool | None = None,
+        category: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        where: list[str] = []
+        params: list[Any] = []
+        if category is not None:
+            where.append("security_category = %s")
+            params.append(category)
+        if suspicious is not None:
+            if suspicious:
+                where.append(
+                    "(security_category IS NULL OR security_category = ANY(%s))"
+                )
+                params.append(list(REVIEW_CATEGORIES))
+            else:
+                where.append("security_category = 'consistent'")
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM attachments{where_sql}", params)
+            total = cur.fetchone()[0]
+            cur.execute(
+                f"SELECT * FROM attachments{where_sql} ORDER BY id DESC LIMIT %s OFFSET %s",
+                [*params, limit, offset],
+            )
+            desc = cur.description
+            rows = [_shape_attachment_row(r, desc) for r in cur.fetchall()]
+        return {"count": total, "limit": limit, "offset": offset, "results": rows}
+
+    def attachments_for_rescan(
+        self, *, only_unclassified: bool, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM attachments"
+        params: list[Any] = []
+        if only_unclassified:
+            sql += " WHERE security_category IS NULL"
+        sql += " ORDER BY id"
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(limit)
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            desc = cur.description
+            return [_shape_attachment_row(r, desc) for r in cur.fetchall()]
+
+    def set_attachment_security(
+        self,
+        attachment_id: int,
+        *,
+        category: str,
+        detected_signature: str | None,
+        detected_mime: str | None,
+        evidence: list[dict[str, Any]],
+        classifier_version: str,
+        inspected_bytes: int,
+        classified_at: datetime,
+    ) -> None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE attachments SET
+                    security_category = %s,
+                    security_detected_sig = %s,
+                    security_detected_mime = %s,
+                    security_evidence = %s,
+                    security_classifier = %s,
+                    security_inspected = %s,
+                    security_classified_at = %s
+                WHERE id = %s
+                """,
+                (
+                    category,
+                    detected_signature,
+                    detected_mime,
+                    Jsonb(evidence),
+                    classifier_version,
+                    inspected_bytes,
+                    _dt(classified_at),
+                    attachment_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise KeyError(attachment_id)
+            conn.commit()
+
+
+def _shape_attachment_row(row: tuple, description: Any) -> dict[str, Any]:
+    """Flattened columns plus a nested ``security`` object for the API."""
+    data = dict(zip([c.name for c in description], row))
+    data["security"] = security_from_columns(
+        category=data.get("security_category"),
+        detected_sig=data.get("security_detected_sig"),
+        detected_mime=data.get("security_detected_mime"),
+        evidence=data.get("security_evidence"),
+        classifier=data.get("security_classifier"),
+        inspected=data.get("security_inspected"),
+        declared_mime=_raw_mime_of(data.get("content_type")),
+        declared_extension=_ext_of(data.get("filename")),
+    )
+    return _jsonify(data)
+
+
+def _raw_mime_of(content_type: str | None) -> str | None:
+    if not content_type:
+        return None
+    raw = content_type.split(";", 1)[0].strip().lower()
+    return raw or None
+
+
+def _ext_of(filename: str | None) -> str | None:
+    if not filename:
+        return None
+    leaf = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    if "." not in leaf:
+        return None
+    ext = leaf.rsplit(".", 1)[1].strip().lower()
+    return ext or None
 
 
 def _jsonify(value: Any) -> Any:

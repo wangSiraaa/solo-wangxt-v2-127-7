@@ -14,7 +14,10 @@ There is **no frontend** — JSON HTTP API only.
 | Attachment path escape | Storage root is resolved once; sender-supplied names are reduced to one safe basename (`app/storage.py::safe_basename`) and bytes are written to **content-addressed** shard names. Every path is re-validated with `Path.relative_to(root)`. Downloads re-validate the stored path and serve a sanitized `Content-Disposition` filename. |
 | HTML / scripts / remote resources | HTML is stored only as: sanitized allow-list HTML (`safe_html`), fully escaped HTML (`escaped_html`), and extracted plain text. The stdlib allow-list sanitizer (`app/parser/html_sanitizer.py`) removes `<script>`, `<style>`, `<iframe>`, event handlers, `style=`/`class=`/`data=`, and **every** loading URL except inline `cid:` resources. Remote `http(s)`, protocol-relative, `data:`, `vbscript:` and `javascript:` loaders are stripped. |
 | Inline resources | `multipart/related` / `Content-ID` parts are parsed as binary attachments with `content_id`; HTML parts record `referenced_cids` — links are facts, nothing is fetched. |
-| Attachment bytes in logs | Only metadata is logged (content type, size, sha256, relative path). A test asserts payload markers never appear in log records. |
+| Attachment bytes in logs | Only metadata is logged (content type, size, sha256, relative path, security category, signature rule id). A test asserts payload markers never appear in log records. |
+| Attachment type masquerade | Every attachment is classified at ingest by a **finite** rule table (`app/parser/attachment_security.py`): binary file signatures (PE/MZ, ELF, Mach-O, Java class, DEX, shebang, PDF/PNG/JPEG/GIF/ZIP-family/…), executable extensions/MIMEs, and a conservative text heuristic. Verdicts are `executable` / `mismatch` / `unknown` / `consistent`. Unknown and unclassified content is **never** called safe. Classification only reads a bounded 64 KiB prefix and never executes/imports/mounts bytes. The original filename, declared MIME and the rule-by-rule basis (`evidence`) are preserved with the record. |
+| Review queue & downloads | `GET /attachments?suspicious=true` lists attachments needing review; downloads are never refused (legitimate forensics) but carry `X-Attachment-Security`, a RFC-style `Warning: 299 …` advisory and `X-Content-Type-Options: nosniff`. |
+| Legacy records | `POST /attachments/rescan` backfills classifications by re-reading stored bytes **read-only** through the storage boundary, verifying their sha256 first. On checksum mismatch the record is skipped and the old verdict kept; stored bytes are never modified. |
 | Upload size | Hard streaming cap (`EMLARCH_MAX_UPLOAD_BYTES`) before persistence. |
 | SQL | psycopg3 parameterized statements throughout; no string-built DML. |
 | File modes | Stored files default to `0600`. |
@@ -55,7 +58,9 @@ Implemented in `app/threads.py` (pure function, unit tested):
 |---|---|---|
 | POST | `/ingest` | multipart upload of one `.eml`; returns status, digest, parts, attachments, threading report |
 | GET | `/messages` / `/messages/{id}` | list / full detail (tree, bodies, attachments, defects) |
-| GET | `/messages/{id}/attachments/{aid}/download` | stream attachment bytes (path re-validated) |
+| GET | `/messages/{id}/attachments/{aid}/download` | stream attachment bytes (path re-validated) with security advisory headers; never refused |
+| GET | `/attachments` | review queue: `?suspicious=true|false`, `?category=executable|mismatch|unknown|consistent` |
+| POST | `/attachments/rescan` | read-only rescan of stored bytes (`?only_unclassified=true` default); backfills categories without changing bytes |
 | GET | `/search?q=` | substring over subject, Message-ID, all header values, body plain text |
 | GET | `/threads` / `/threads/{key}` | thread summaries / ordered members with reference headers |
 | POST | `/threads/rebuild` | recompute all threads; returns conflicts/cycles/dangling/weak hints |
@@ -85,13 +90,14 @@ Without a DSN the service boots an in-memory repository (useful for demos).
 ls samples/
 # 01 multibyte/nested, 02 circular refs, 03 missing id + bogus charset,
 # 04 duplicate ids, 05 same subject different threads, 06 corrupt boundary,
-# 07 bad CTE, 08 path traversal attachment, 09 XSS/remote HTML
+# 07 bad CTE, 08 path traversal attachment, 09 XSS/remote HTML,
+# 10 disguised attachments (MZ-as-.txt, PNG-as-.jpg, unknown blob)
 ```
 
 ### Tests
 
 ```bash
-.venv/bin/python -m pytest                       # 47 unit + API tests (memory backend)
+.venv/bin/python -m pytest                       # unit + API tests (memory backend)
 EMLARCH_RUN_PG_TESTS=1 EMLARCH_TEST_DSN='postgresql://postgres@/postgres?host=/tmp/pgsock&port=55432' \
   .venv/bin/python -m pytest                     # + real PostgreSQL integration tests
 ```
@@ -110,6 +116,7 @@ app/
   config.py            env-driven configuration (roots, cap, DSN)
   parser/
     eml_parser.py      stdlib email parsing, structural walk, charset ladder
+    attachment_security.py  finite signature/extension classifier (read-only)
     html_sanitizer.py  allow-list sanitizer + escaping + text extraction
     models.py          structured result dataclasses
   storage.py           ControlledStorage (path safety, 0600, metadata logs)
