@@ -28,6 +28,11 @@ class AttachmentSummary(BaseModel):
     byte_size: int
     sha256: str | None = None
     error: str | None = None
+    # Safety classification at ingest time (app/attachment_security.py)
+    safety_category: str | None = None  # matched | executable | mismatch | unknown
+    suspicious: bool = False
+    detected_signature: str | None = None
+    safety_reasons: list[str] = Field(default_factory=list)
 
 
 class IngestResponse(BaseModel):
@@ -81,6 +86,14 @@ class AttachmentOut(BaseModel):
     checksum_sha256: str
     storage_path: str | None
     stored: bool
+    # Safety classification; safety_category=None means "not yet classified"
+    # (legacy row — run POST /attachments/rescan), distinct from "unknown".
+    safety_category: str | None = None
+    suspicious: bool = False
+    detected_signature: str | None = None
+    safety_reasons: list[str] = Field(default_factory=list)
+    classifier_version: str | None = None
+    classified_at: datetime | None = None
 
 
 class HeaderOut(BaseModel):

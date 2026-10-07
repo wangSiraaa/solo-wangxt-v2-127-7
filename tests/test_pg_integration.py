@@ -96,3 +96,43 @@ def test_idempotent_schema_init(pg_client):
     # creating a second repository over the same DSN must not error on DDL
     arch.repo.init_schema()
     assert c.get("/health").status_code == 200
+
+
+def test_attachment_safety_sql_roundtrip(pg_client):
+    c, _ = pg_client
+    mz = b"MZ" + b"\x90" * 40
+    eml = (
+        b"From: a@example.com\r\nTo: b@example.com\r\nSubject: ev\r\n"
+        b"Message-ID: <pg-safety@example.com>\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b'Content-Type: multipart/mixed; boundary="bb"\r\n\r\n'
+        b"--bb\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n"
+        b"--bb\r\nContent-Type: text/plain; name=invoice.txt\r\n"
+        b'Content-Disposition: attachment; filename="invoice.txt"\r\n'
+        b"Content-Transfer-Encoding: base64\r\n\r\n"
+        + __import__("base64").b64encode(mz)
+        + b"\r\n--bb--\r\n"
+    )
+    r = c.post("/ingest", files={"file": ("ev.eml", eml, "message/rfc822")})
+    assert r.status_code == 201, r.text
+    att = r.json()["attachments"][0]
+    assert att["safety_category"] == "executable"
+
+    # filtered listing via SQL WHERE clauses
+    suspicious = c.get("/attachments", params={"suspicious": True}).json()
+    assert len(suspicious) == 1 and suspicious[0]["safety_reasons"]
+    assert c.get("/attachments", params={"suspicious": False}).json() == []
+    assert len(c.get("/attachments", params={"category": "executable"}).json()) == 1
+
+    # download carries advisory headers, bytes intact
+    pk = r.json()["message_pk"]
+    dl = c.get(f"/messages/{pk}/attachments/{suspicious[0]['id']}/download")
+    assert dl.status_code == 200 and dl.content == mz
+    assert dl.headers["x-attachment-safety-category"] == "executable"
+
+    # read-only rescan updates classification columns only
+    rescan = c.post("/attachments/rescan").json()
+    assert rescan["updated"] == 1 and rescan["digest_mismatch"] == 0
+    after = c.get(f"/messages/{pk}").json()["attachments"][0]
+    assert after["safety_category"] == "executable"
+    assert after["storage_path"] == suspicious[0]["storage_path"]

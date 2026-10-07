@@ -1,13 +1,15 @@
 """Application services: orchestrate parse, controlled storage, persistence."""
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from typing import Any
 
+from app.attachment_security import classify_attachment
 from app.parser import ParseStatus, parse_eml
 from app.repository import Repository
-from app.storage import ControlledStorage
+from app.storage import ControlledStorage, StorageError
 
 log = logging.getLogger("emlarchive.service")
 
@@ -48,6 +50,22 @@ class IngestService:
         for att in parsed.attachments:
             if att.bytes_to_persist is None:
                 continue
+            # Classify from the in-memory bytes *before* they are released.
+            # The classifier only reads a prefix; content is never executed.
+            att.safety = classify_attachment(att.filename, att.content_type, att.bytes_to_persist)
+            if att.safety.suspicious:
+                # Metadata only — attachment bytes never enter a log line.
+                log.warning(
+                    "suspicious attachment part=%s name=%r content_type=%s category=%s "
+                    "signature=%s bytes=%d sha256=%s",
+                    att.mime_path,
+                    att.filename,
+                    att.content_type,
+                    att.safety.category.value,
+                    att.safety.detected_signature,
+                    att.byte_size,
+                    att.checksum_sha256,
+                )
             try:
                 rel = self._att.store_attachment(
                     att.bytes_to_persist,
@@ -72,6 +90,10 @@ class IngestService:
                         "stored": False,
                         "error": str(exc),
                         "byte_size": att.byte_size,
+                        "safety_category": att.safety.category.value,
+                        "suspicious": att.safety.suspicious,
+                        "detected_signature": att.safety.detected_signature,
+                        "safety_reasons": list(att.safety.reasons),
                     }
                 )
                 continue
@@ -87,6 +109,10 @@ class IngestService:
                     "storage_path": rel,
                     "byte_size": att.byte_size,
                     "sha256": att.checksum_sha256,
+                    "safety_category": att.safety.category.value,
+                    "suspicious": att.safety.suspicious,
+                    "detected_signature": att.safety.detected_signature,
+                    "safety_reasons": list(att.safety.reasons),
                 }
             )
 
@@ -114,3 +140,66 @@ class IngestService:
             attachments=att_summaries,
             threads=threads,
         )
+
+    def rescan_attachment_safety(self, *, batch_size: int = 200) -> dict[str, Any]:
+        """Re-classify stored attachments without touching their bytes.
+
+        Read-only with respect to evidence: bytes are read back from the
+        controlled store, verified against the recorded sha256, classified,
+        and only the classification columns are updated. Files whose digest
+        no longer matches the recorded checksum are reported, not re-labeled.
+        """
+        scanned = updated = missing_bytes = digest_mismatch = 0
+        offset = 0
+        while True:
+            rows = self._repo.list_attachments(
+                suspicious=None, category=None, limit=batch_size, offset=offset
+            )
+            if not rows:
+                break
+            offset += len(rows)
+            for row in rows:
+                rel = row.get("storage_path")
+                if not rel:
+                    continue  # never stored (or failed) — nothing to rescan
+                try:
+                    path = self._att.resolve(rel)
+                except StorageError:
+                    log.error("rescan skipped id=%s: stored path rejected", row.get("id"))
+                    continue
+                if not path.is_file():
+                    missing_bytes += 1
+                    log.warning(
+                        "rescan: bytes missing id=%s sha256=%s relpath=%s",
+                        row.get("id"),
+                        row.get("checksum_sha256"),
+                        rel,
+                    )
+                    continue
+                data = path.read_bytes()
+                digest = hashlib.sha256(data).hexdigest()
+                recorded = row.get("checksum_sha256")
+                if recorded and digest != recorded:
+                    # Evidence integrity problem: surface it, do not relabel.
+                    digest_mismatch += 1
+                    log.error(
+                        "rescan digest mismatch id=%s recorded=%s actual=%s relpath=%s",
+                        row.get("id"),
+                        recorded,
+                        digest,
+                        rel,
+                    )
+                    continue
+                verdict = classify_attachment(row.get("filename"), row.get("content_type"), data)
+                self._repo.update_attachment_safety(row["id"], verdict)
+                scanned += 1
+                updated += 1
+        result = {
+            "scanned": scanned,
+            "updated": updated,
+            "missing_bytes": missing_bytes,
+            "digest_mismatch": digest_mismatch,
+        }
+        # Metadata only — never log content.
+        log.info("attachment safety rescan complete: %s", result)
+        return result

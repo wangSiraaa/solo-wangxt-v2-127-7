@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol, Sequence
 
+from app.attachment_security import AttachmentSafety
 from app.parser.models import ParsedMessage
 
 
@@ -44,3 +45,22 @@ class Repository(Protocol):
     def list_failures(self, limit: int, offset: int) -> list[dict[str, Any]]: ...
     def get_attachment(self, attachment_id: int) -> dict[str, Any] | None: ...
     def get_attachment_by_message(self, message_pk: int, attachment_id: int) -> dict[str, Any] | None: ...
+
+    def list_attachments(
+        self,
+        suspicious: bool | None,
+        category: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[dict[str, Any]]:
+        """List attachment metadata rows, optionally filtered by the safety
+        classification (``suspicious`` flag and/or exact category)."""
+        ...
+
+    def update_attachment_safety(self, attachment_id: int, safety: AttachmentSafety) -> None:
+        """Update only the safety-classification columns of one attachment.
+
+        Used by the read-only rescan: stored bytes and ``storage_path`` are
+        never touched, so evidence stays byte-identical.
+        """
+        ...

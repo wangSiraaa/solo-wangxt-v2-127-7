@@ -11,6 +11,7 @@ from typing import Any, Sequence
 
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
+from app.attachment_security import AttachmentSafety
 from app.threads import ThreadInput, compute_threads
 
 
@@ -140,6 +141,12 @@ class MemoryRepository:
                         "checksum_sha256": att.checksum_sha256,
                         "storage_path": att.storage_path,
                         "stored": att.storage_path is not None,
+                        "safety_category": att.safety.category.value if att.safety else None,
+                        "suspicious": att.safety.suspicious if att.safety else False,
+                        "detected_signature": att.safety.detected_signature if att.safety else None,
+                        "safety_reasons": list(att.safety.reasons) if att.safety else [],
+                        "classifier_version": att.safety.classifier_version if att.safety else None,
+                        "classified_at": datetime.now(timezone.utc) if att.safety else None,
                     }
                 )
         self.defects.extend(
@@ -326,3 +333,30 @@ class MemoryRepository:
             if a["id"] == attachment_id:
                 return dict(a)
         return None
+
+    def list_attachments(
+        self,
+        suspicious: bool | None = None,
+        category: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        rows = sorted(self.attachments, key=lambda a: a["id"])
+        if suspicious is not None:
+            rows = [a for a in rows if a["suspicious"] is suspicious]
+        if category is not None:
+            rows = [a for a in rows if a["safety_category"] == category]
+        return [dict(a) for a in rows[offset : offset + limit]]
+
+    def update_attachment_safety(self, attachment_id: int, safety: AttachmentSafety) -> None:
+        for a in self.attachments:
+            if a["id"] == attachment_id:
+                # Classification columns only — bytes/storage_path untouched.
+                a["safety_category"] = safety.category.value
+                a["suspicious"] = safety.suspicious
+                a["detected_signature"] = safety.detected_signature
+                a["safety_reasons"] = list(safety.reasons)
+                a["classifier_version"] = safety.classifier_version
+                a["classified_at"] = datetime.now(timezone.utc)
+                return
+        raise KeyError(f"attachment {attachment_id} not found")

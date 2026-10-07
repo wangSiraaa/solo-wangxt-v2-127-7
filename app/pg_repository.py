@@ -11,6 +11,7 @@ from psycopg.types.json import Jsonb
 
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
+from app.attachment_security import AttachmentSafety
 from app.threads import ThreadInput, compute_threads
 
 _SCHEMA_PATH = Path(__file__).parent / "sql" / "schema.sql"
@@ -151,8 +152,10 @@ class PgRepository:
                         """
                         INSERT INTO attachments (message_pk, mime_path, content_type, charset,
                             disposition, filename, raw_filename, content_id, content_location,
-                            byte_size, checksum_sha256, storage_path, stored)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            byte_size, checksum_sha256, storage_path, stored,
+                            safety_category, suspicious, detected_signature, safety_reasons,
+                            classifier_version, classified_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         """,
                         (
                             message_pk,
@@ -168,6 +171,12 @@ class PgRepository:
                             att.checksum_sha256,
                             rel,
                             rel is not None,
+                            att.safety.category.value if att.safety else None,
+                            att.safety.suspicious if att.safety else False,
+                            att.safety.detected_signature if att.safety else None,
+                            Jsonb(att.safety.reasons if att.safety else []),
+                            att.safety.classifier_version if att.safety else None,
+                            datetime.now(timezone.utc) if att.safety else None,
                         ),
                     )
 
@@ -373,6 +382,48 @@ class PgRepository:
                 return None
             cols = [c.name for c in cur.description]
             return _jsonify(dict(zip(cols, row)))
+
+    def list_attachments(
+        self,
+        suspicious: bool | None = None,
+        category: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM attachments
+                WHERE (%s::boolean IS NULL OR suspicious = %s)
+                  AND (%s::text IS NULL OR safety_category = %s)
+                ORDER BY id LIMIT %s OFFSET %s
+                """,
+                (suspicious, suspicious, category, category, limit, offset),
+            )
+            cols = [c.name for c in cur.description]
+            return _jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
+
+    def update_attachment_safety(self, attachment_id: int, safety: AttachmentSafety) -> None:
+        """Update classification columns only — evidence bytes/paths untouched."""
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE attachments
+                SET safety_category = %s, suspicious = %s, detected_signature = %s,
+                    safety_reasons = %s, classifier_version = %s, classified_at = %s
+                WHERE id = %s
+                """,
+                (
+                    safety.category.value,
+                    safety.suspicious,
+                    safety.detected_signature,
+                    Jsonb(safety.reasons),
+                    safety.classifier_version,
+                    datetime.now(timezone.utc),
+                    attachment_id,
+                ),
+            )
+            conn.commit()
 
 
 def _jsonify(value: Any) -> Any:

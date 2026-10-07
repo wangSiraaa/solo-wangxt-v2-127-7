@@ -16,6 +16,7 @@ from app.memory_repository import MemoryRepository
 from app.pg_repository import PgRepository
 from app.repository import Repository
 from app.schemas import (
+    AttachmentOut,
     FailureOut,
     Health,
     IngestDetail,
@@ -32,6 +33,13 @@ from app.storage import ControlledStorage, StorageError
 log = logging.getLogger("emlarchive.api")
 
 _CHUNK = 1024 * 1024
+
+_SAFETY_CATEGORIES = frozenset({"matched", "executable", "mismatch", "unknown"})
+
+
+def _ascii_header(value: str) -> str:
+    """Reduce a string to printable ASCII so it is a safe HTTP header value."""
+    return "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in value)
 
 
 class AppState:
@@ -179,6 +187,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return thread
 
     # ---- attachments -----------------------------------------------------
+    @app.get("/attachments", response_model=list[AttachmentOut], tags=["attachments"])
+    def list_attachments(
+        request: Request,
+        suspicious: bool | None = Query(None, description="filter: only suspicious / only clean verdicts"),
+        category: str | None = Query(
+            None, description="filter by verdict: matched | executable | mismatch | unknown"
+        ),
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> list[dict[str, Any]]:
+        if category is not None and category not in _SAFETY_CATEGORIES:
+            raise HTTPException(status_code=422, detail=f"unknown safety category {category!r}")
+        return get_state(request).repo.list_attachments(suspicious, category, limit, offset)
+
+    @app.post("/attachments/rescan", tags=["attachments"])
+    def rescan_attachments(request: Request) -> dict[str, Any]:
+        """Read-only re-classification of stored attachments.
+
+        Bytes are read back, verified against the recorded sha256 and
+        re-classified; only classification columns change — evidence bytes
+        and storage paths are never modified.
+        """
+        return get_state(request).service.rescan_attachment_safety()
+
     @app.get("/messages/{pk}/attachments/{attachment_id}/download", tags=["attachments"])
     def download_attachment(request: Request, pk: int, attachment_id: int) -> Response:
         st = get_state(request)
@@ -202,11 +234,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from app.storage import safe_basename
 
         safe_name = safe_basename(att.get("filename") or "") or f"attachment-{attachment_id}.bin"
+
+        # Advisory headers only: the archivist is *warned*, never blocked —
+        # downloads of suspicious evidence remain possible by design.
+        headers = {"X-Content-Type-Options": "nosniff"}
+        category = att.get("safety_category")
+        if category:
+            headers["X-Attachment-Safety-Category"] = category
+            headers["X-Attachment-Suspicious"] = "true" if att.get("suspicious") else "false"
+            if att.get("suspicious"):
+                reasons = att.get("safety_reasons") or []
+                warning = "; ".join(reasons) if reasons else "flagged by attachment safety classifier"
+                # Header values must be latin-1; keep the warning ASCII-only.
+                headers["X-Attachment-Safety-Warning"] = _ascii_header(warning)[:300]
+                log.warning(
+                    "serving suspicious attachment id=%d category=%s sha256=%s name=%r",
+                    attachment_id,
+                    category,
+                    att.get("checksum_sha256"),
+                    att.get("filename"),
+                )
         # FileResponse streams from disk; we never put content into a log line.
         return FileResponse(
             path,
             media_type=att.get("content_type") or "application/octet-stream",
             filename=safe_name,
+            headers=headers,
         )
 
     @app.get("/health", response_model=Health, tags=["meta"])

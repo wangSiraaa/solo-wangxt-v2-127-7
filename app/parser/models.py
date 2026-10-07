@@ -8,6 +8,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # avoid a runtime dependency from parser -> service layer
+    from app.attachment_security import AttachmentSafety
 
 
 class ParseStatus(str, Enum):
@@ -79,6 +83,9 @@ class Attachment:
     # Filled in by the storage layer; parser leaves both as None.
     storage_path: str | None = None  # path relative to the controlled root
     bytes_to_persist: bytes | None = field(default=None, repr=False)
+    # Filled in by the ingest service (attachment_security classifier);
+    # the parser itself never inspects content for safety.
+    safety: "AttachmentSafety | None" = None
 
 
 @dataclass(frozen=True)

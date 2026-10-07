@@ -93,10 +93,29 @@ CREATE TABLE IF NOT EXISTS attachments (
     byte_size       BIGINT NOT NULL,
     checksum_sha256 TEXT NOT NULL,
     storage_path    TEXT,
-    stored          BOOLEAN NOT NULL DEFAULT FALSE
+    stored          BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Safety classification (app/attachment_security.py). NULL category means
+    -- "not yet classified" (legacy row) — distinct from 'unknown', which is a
+    -- deliberate verdict. Original filename/MIME above are never rewritten.
+    safety_category TEXT CHECK (safety_category IN ('matched','executable','mismatch','unknown')),
+    suspicious      BOOLEAN NOT NULL DEFAULT FALSE,
+    detected_signature TEXT,
+    safety_reasons  JSONB NOT NULL DEFAULT '[]',
+    classifier_version TEXT,
+    classified_at   TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_attach_message ON attachments(message_pk);
 CREATE INDEX IF NOT EXISTS idx_attach_sha ON attachments(checksum_sha256);
+CREATE INDEX IF NOT EXISTS idx_attach_suspicious ON attachments(suspicious) WHERE suspicious;
+CREATE INDEX IF NOT EXISTS idx_attach_safety ON attachments(safety_category);
+
+-- Upgrades for pre-existing databases: add classification columns idempotently.
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS safety_category TEXT;
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS suspicious BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS detected_signature TEXT;
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS safety_reasons JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS classifier_version TEXT;
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS classified_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS defects (
     id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

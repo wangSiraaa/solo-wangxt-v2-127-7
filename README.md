@@ -15,6 +15,7 @@ There is **no frontend** — JSON HTTP API only.
 | HTML / scripts / remote resources | HTML is stored only as: sanitized allow-list HTML (`safe_html`), fully escaped HTML (`escaped_html`), and extracted plain text. The stdlib allow-list sanitizer (`app/parser/html_sanitizer.py`) removes `<script>`, `<style>`, `<iframe>`, event handlers, `style=`/`class=`/`data=`, and **every** loading URL except inline `cid:` resources. Remote `http(s)`, protocol-relative, `data:`, `vbscript:` and `javascript:` loaders are stripped. |
 | Inline resources | `multipart/related` / `Content-ID` parts are parsed as binary attachments with `content_id`; HTML parts record `referenced_cids` — links are facts, nothing is fetched. |
 | Attachment bytes in logs | Only metadata is logged (content type, size, sha256, relative path). A test asserts payload markers never appear in log records. |
+| Attachment safety classification | At ingest each attachment is classified from a **limited** magic-signature table plus extension/MIME rules (`app/attachment_security.py`): `matched` / `executable` / `mismatch` / `unknown`. The original filename, declared MIME, detected signature and human-readable reasons are stored with the record. Unknown formats are **never asserted safe**; content is only read, never executed. Downloads carry advisory headers (`X-Attachment-Safety-*`, `nosniff`) but are **not refused** — forensic access is preserved. `POST /attachments/rescan` re-classifies stored evidence read-only (sha256-verified, bytes untouched) so legacy rows can be backfilled. |
 | Upload size | Hard streaming cap (`EMLARCH_MAX_UPLOAD_BYTES`) before persistence. |
 | SQL | psycopg3 parameterized statements throughout; no string-built DML. |
 | File modes | Stored files default to `0600`. |
@@ -55,7 +56,9 @@ Implemented in `app/threads.py` (pure function, unit tested):
 |---|---|---|
 | POST | `/ingest` | multipart upload of one `.eml`; returns status, digest, parts, attachments, threading report |
 | GET | `/messages` / `/messages/{id}` | list / full detail (tree, bodies, attachments, defects) |
-| GET | `/messages/{id}/attachments/{aid}/download` | stream attachment bytes (path re-validated) |
+| GET | `/messages/{id}/attachments/{aid}/download` | stream attachment bytes (path re-validated); suspicious verdicts add `X-Attachment-Safety-*` warning headers but are still served |
+| GET | `/attachments?suspicious=&category=` | list attachment metadata, filterable by safety verdict (`matched`/`executable`/`mismatch`/`unknown`) |
+| POST | `/attachments/rescan` | read-only re-classification of stored attachments (sha256-verified; updates classification columns only) |
 | GET | `/search?q=` | substring over subject, Message-ID, all header values, body plain text |
 | GET | `/threads` / `/threads/{key}` | thread summaries / ordered members with reference headers |
 | POST | `/threads/rebuild` | recompute all threads; returns conflicts/cycles/dangling/weak hints |
@@ -113,6 +116,7 @@ app/
     html_sanitizer.py  allow-list sanitizer + escaping + text extraction
     models.py          structured result dataclasses
   storage.py           ControlledStorage (path safety, 0600, metadata logs)
+  attachment_security.py  magic-signature + extension/MIME safety classifier
   threads.py           Message-ID graph + cycles + conflicts + weak subjects
   pg_repository.py     PostgreSQL persistence (psycopg3)
   memory_repository.py same interface, in-memory (tests / demo)
